@@ -1,0 +1,199 @@
+
+name: Build PixelKit Signed Release APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Signed Release APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Extract PixelKit source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f pixelkit-fixed.zip
+          mkdir -p /tmp/pixelkit-source
+          unzip -q pixelkit-fixed.zip -d /tmp/pixelkit-source
+          SOURCE_DIR="$(find /tmp/pixelkit-source -type f -name package.json -print -quit | xargs -r dirname)"
+          test -f "$SOURCE_DIR/package.json"
+          cp -a "$SOURCE_DIR/." .
+
+      - name: Verify source files
+        run: |
+          set -euo pipefail
+          test -f package.json
+          test -d src
+          test -d public
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Build web app
+        env:
+          CI: "false"
+        run: npm run build
+
+      - name: Install Capacitor assets tool
+        run: npm install --no-save @capacitor/assets
+
+      - name: Generate Android project
+        run: npx cap add android
+
+      - name: Sync Android project
+        run: npx cap sync android
+
+      - name: Decode signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$KEYSTORE_BASE64"
+          mkdir -p android/app
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > android/app/pixelkit-release.p12
+          test -s android/app/pixelkit-release.p12
+          echo "Signing key decoded."
+
+      - name: Verify signing key
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$KEYSTORE_PASSWORD"
+          test -n "$KEY_ALIAS"
+          keytool -list \
+            -storetype PKCS12 \
+            -keystore android/app/pixelkit-release.p12 \
+            -storepass "$KEYSTORE_PASSWORD" \
+            -alias "$KEY_ALIAS"
+          echo "Signing key verified."
+
+      - name: Create signing properties
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$KEYSTORE_PASSWORD"
+          test -n "$KEY_ALIAS"
+          test -n "$KEY_PASSWORD"
+          {
+            printf 'storeFile=pixelkit-release.p12\n'
+            printf 'storePassword=%s\n' "$KEYSTORE_PASSWORD"
+            printf 'keyAlias=%s\n' "$KEY_ALIAS"
+            printf 'keyPassword=%s\n' "$KEY_PASSWORD"
+          } > android/keystore.properties
+          echo "Signing properties created."
+
+      - name: Configure release signing
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path("android/app/build.gradle")
+          if not path.exists():
+              raise SystemExit("ERROR: Android app build.gradle not found.")
+
+          text = path.read_text()
+
+          if "keystorePropertiesFile" in text:
+              raise SystemExit("ERROR: Signing properties loader already exists.")
+
+          loader = """
+          def keystorePropertiesFile = rootProject.file("keystore.properties")
+          def keystoreProperties = new Properties()
+          keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
+          """
+
+          android_match = re.search(r'\bandroid\s*\{', text)
+          if not android_match:
+              raise SystemExit("ERROR: Android Gradle block not found.")
+
+          text = text[:android_match.end()] + loader + text[android_match.end():]
+
+          signing = """
+              signingConfigs {
+                  release {
+                      storeFile file(keystoreProperties["storeFile"])
+                      storePassword keystoreProperties["storePassword"]
+                      keyAlias keystoreProperties["keyAlias"]
+                      keyPassword keystoreProperties["keyPassword"]
+                  }
+              }
+          """
+
+          build_types = re.search(r'\bbuildTypes\s*\{', text)
+          if not build_types:
+              raise SystemExit("ERROR: buildTypes block not found.")
+
+          text = text[:build_types.start()] + signing + "\n" + text[build_types.start():]
+
+          build_types = re.search(r'\bbuildTypes\s*\{', text)
+          release = re.search(r'\brelease\s*\{', text[build_types.end():])
+          if not release:
+              text = text[:build_types.end()] + """
+                  release {
+                      signingConfig signingConfigs.release
+                  }
+              """ + text[build_types.end():]
+          else:
+              pos = build_types.end() + release.end()
+              text = text[:pos] + "\n            signingConfig signingConfigs.release" + text[pos:]
+
+          path.write_text(text)
+          print("Release signing configured.")
+          PY
+
+      - name: Build signed release APK
+        working-directory: android
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon
+
+      - name: Verify and locate release APK
+        id: apk
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="$(find android/app/build/outputs/apk/release -type f -name '*.apk' -print -quit)"
+          test -n "$APK"
+          echo "path=$APK" >> "$GITHUB_OUTPUT"
+          ls -lh "$APK"
+
+      - name: Upload signed release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: PixelKit-signed-release-apk
+          path: ${{ steps.apk.outputs.path }}
+          if-no-files-found: error
+          retention-days: 14
+          
